@@ -586,7 +586,10 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        default_key = st.secrets.get("FMP_API_KEY", "") if hasattr(st, "secrets") else ""
+        try:
+            default_key = st.secrets["FMP_API_KEY"]
+        except Exception:
+            default_key = ""
         api_key = st.text_input("FMP API Key", value=default_key, type="password")
         st.divider()
         symbol = st.text_input("Symbol", value="SPY").upper().strip()
