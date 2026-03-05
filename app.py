@@ -586,7 +586,8 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        api_key = st.text_input("FMP API Key", type="password")
+        default_key = st.secrets.get("FMP_API_KEY", "") if hasattr(st, "secrets") else ""
+        api_key = st.text_input("FMP API Key", value=default_key, type="password")
         st.divider()
         symbol = st.text_input("Symbol", value="SPY").upper().strip()
         interval = st.selectbox("Intraday Interval", ["1min","5min","15min","30min","1hour"], index=1)
