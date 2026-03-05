@@ -9,7 +9,7 @@ Multi-Strategy Trading Dashboard — Streamlit App
   5. Rule of 4 (Post-Event)
   6. Volume Profile Breakout Zones (VAH→LVN / VAL→LVN)
 
-Data: FMP API (intraday + daily)
+Data: FMP API (daily) + yfinance (intraday fallback)
 """
 
 import streamlit as st
@@ -18,6 +18,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+import yfinance as yf
 from datetime import datetime, timedelta, time as dtime
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -55,42 +56,73 @@ st.markdown("""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FMP API
+# DATA FETCHING: FMP (daily) + yfinance (intraday)
 # ══════════════════════════════════════════════════════════════════════════════
+YF_INTERVAL_MAP = {
+    "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "1hour": "1h",
+}
+
 @st.cache_data(ttl=300)
 def fetch_intraday(symbol, api_key, interval="5min", days_back=15):
-    url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
+    """Fetch intraday data from yfinance (FMP intraday requires paid plan)."""
+    yf_interval = YF_INTERVAL_MAP.get(interval, "5m")
+    # yfinance limits: 1m=7d, 5m/15m/30m=60d, 1h=730d
+    max_days = 7 if yf_interval == "1m" else 60
+    period_days = min(days_back, max_days)
     try:
-        r = requests.get(url, params={"apikey": api_key}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data or isinstance(data, dict):
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=f"{period_days}d", interval=yf_interval)
+        if df.empty:
             return pd.DataFrame()
-        df = pd.DataFrame(data)
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+        # Rename 'datetime' or 'date' column
+        if "datetime" in df.columns:
+            df = df.rename(columns={"datetime": "date"})
         df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
-        cutoff = datetime.now() - timedelta(days=days_back)
-        return df[df["date"] >= cutoff].reset_index(drop=True)
+        if df["date"].dt.tz is not None:
+            df["date"] = df["date"].dt.tz_localize(None)
+        df = df[["date", "open", "high", "low", "close", "volume"]]
+        return df.sort_values("date").reset_index(drop=True)
     except Exception as e:
-        st.error(f"API error: {e}")
+        st.warning(f"yfinance error: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
 def fetch_daily(symbol, api_key, days=60):
-    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
+    """Fetch daily data from FMP stable API, fallback to yfinance."""
+    url = f"https://financialmodelingprep.com/stable/historical-price-eod/full"
     try:
-        r = requests.get(url, params={"apikey": api_key, "timeseries": days}, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "apikey": api_key}, timeout=15)
         r.raise_for_status()
         data = r.json()
-        if "historical" not in data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data["historical"])
+        if not data or isinstance(data, dict):
+            raise ValueError("No data from FMP")
+        df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date").reset_index(drop=True)
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return pd.DataFrame()
+        df = df.sort_values("date").reset_index(drop=True)
+        # Keep only required columns + limit days
+        cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
+        df = df[cols].tail(days).reset_index(drop=True)
+        return df
+    except Exception:
+        # Fallback to yfinance
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=f"{days}d", interval="1d")
+            if df.empty:
+                return pd.DataFrame()
+            df = df.reset_index()
+            df.columns = [c.lower() for c in df.columns]
+            df["date"] = pd.to_datetime(df["date"])
+            if df["date"].dt.tz is not None:
+                df["date"] = df["date"].dt.tz_localize(None)
+            df = df[["date", "open", "high", "low", "close", "volume"]]
+            return df.sort_values("date").reset_index(drop=True)
+        except Exception as e:
+            st.error(f"Data error: {e}")
+            return pd.DataFrame()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -583,24 +615,23 @@ def base_layout(fig, title, height=600):
 def main():
     st.markdown("## 📊 Multi-Strategy Trading Dashboard")
 
+    # Load API key from secrets
+    try:
+        api_key = st.secrets["FMP_API_KEY"]
+    except Exception:
+        api_key = ""
+
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        try:
-            default_key = st.secrets["FMP_API_KEY"]
-        except Exception:
-            default_key = ""
-        api_key = st.text_input("FMP API Key", value=default_key, type="password")
-        st.divider()
         symbol = st.text_input("Symbol", value="SPY").upper().strip()
         interval = st.selectbox("Intraday Interval", ["1min","5min","15min","30min","1hour"], index=1)
         days_back = st.number_input("Days of Data", 5, 60, 15)
         st.divider()
         run = st.button("🚀 Run All Strategies", type="primary", use_container_width=True)
+        if not api_key:
+            st.caption("⚠️ FMP API Key not set — using yfinance only")
 
-    if not api_key:
-        st.info("👈 Enter your **FMP API Key** to start. All 6 strategies will run at once.")
-        return
     if not run:
         st.info("Click **🚀 Run All Strategies**")
         return
@@ -611,11 +642,12 @@ def main():
         daily = fetch_daily(symbol, api_key, days=max(days_back * 2, 60))
 
     if intra.empty and daily.empty:
-        st.error("No data. Check API key / symbol.")
+        st.error("No data. Check symbol or try again.")
         return
 
-    if not intra.empty:
-        st.success(f"Intraday: **{len(intra):,}** bars | Daily: **{len(daily):,}** bars")
+    intra_txt = f"Intraday: **{len(intra):,}** bars" if not intra.empty else "Intraday: N/A"
+    daily_txt = f"Daily: **{len(daily):,}** bars" if not daily.empty else "Daily: N/A"
+    st.success(f"{intra_txt} | {daily_txt}")
 
     # ── TABS ──
     tabs = st.tabs([
