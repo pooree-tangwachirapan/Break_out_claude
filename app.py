@@ -572,6 +572,14 @@ def main():
     st.markdown("## 📊 Multi-Strategy Trading Dashboard")
     st.caption("Daily data → FMP API  |  Intraday data → yfinance (free)")
 
+    # ── Initialize session state ──
+    if "data_loaded" not in st.session_state:
+        st.session_state.data_loaded = False
+        st.session_state.intra = pd.DataFrame()
+        st.session_state.daily = pd.DataFrame()
+        st.session_state.symbol = ""
+        st.session_state.src_daily = ""
+
     # API key
     try:
         api_key = st.secrets["FMP_API_KEY"]
@@ -581,47 +589,63 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
-        symbol = st.text_input("Symbol", value="SPY").upper().strip()
+        symbol = st.text_input("Symbol", value="SPY", key="sym_input").upper().strip()
 
         st.divider()
         st.markdown("**Intraday** <span class='src-badge src-yf'>yfinance</span>",
                     unsafe_allow_html=True)
-        interval = st.selectbox("Interval", ["1min", "5min", "15min", "30min", "1hour"], index=1)
+        interval = st.selectbox("Interval", ["1min", "5min", "15min", "30min", "1hour"],
+                                index=1, key="interval_input")
         days_back_intra = st.number_input("Intraday Days", 1, 60, 10,
-                                          help="yfinance: 1m→7d max, 5m/15m/30m→60d max")
+                                          help="yfinance: 1m→7d max, 5m/15m/30m→60d max",
+                                          key="intra_days_input")
 
         st.divider()
         st.markdown("**Daily** <span class='src-badge src-fmp'>FMP</span>",
                     unsafe_allow_html=True)
-        days_back_daily = st.number_input("Daily Days", 10, 365, 60)
+        days_back_daily = st.number_input("Daily Days", 10, 365, 60, key="daily_days_input")
 
         if not api_key:
             st.info("💡 FMP key not set — daily data will use yfinance fallback.")
 
         st.divider()
-        run = st.button("🚀 Run All Strategies", type="primary", use_container_width=True)
 
-    if not run:
+        # ── Run button: fetch data and store in session_state ──
+        if st.button("🚀 Run All Strategies", type="primary", use_container_width=True):
+            with st.spinner(f"Fetching intraday {interval} for {symbol} via yfinance..."):
+                st.session_state.intra = fetch_intraday_yf(symbol, interval, days_back_intra)
+
+            with st.spinner(f"Fetching daily for {symbol}..."):
+                st.session_state.daily = fetch_daily_fmp(symbol, api_key, days_back_daily)
+
+            st.session_state.symbol = symbol
+            st.session_state.src_daily = "FMP" if api_key else "yfinance"
+            st.session_state.data_loaded = True
+
+        # Show reload button if data exists with different symbol
+        if st.session_state.data_loaded and st.session_state.symbol != symbol:
+            st.warning(f"Data loaded for **{st.session_state.symbol}**. "
+                       f"Click Run to load **{symbol}**.")
+
+    # ── Gate: need data to proceed ──
+    if not st.session_state.data_loaded:
         st.info("Configure settings and click **🚀 Run All Strategies**")
         return
 
-    # ── Fetch Data ──
-    with st.spinner(f"Fetching intraday {interval} for {symbol} via yfinance..."):
-        intra = fetch_intraday_yf(symbol, interval, days_back_intra)
-
-    with st.spinner(f"Fetching daily for {symbol}..."):
-        daily = fetch_daily_fmp(symbol, api_key, days_back_daily)
+    # ── Use data from session_state ──
+    intra = st.session_state.intra
+    daily = st.session_state.daily
+    symbol = st.session_state.symbol
+    src_daily = st.session_state.src_daily
 
     if intra.empty and daily.empty:
         st.error("No data returned. Check symbol and try again.")
         return
 
     # Status bar
-    src_intra = "yfinance"
-    src_daily = "FMP" if api_key else "yfinance"
-    intra_txt = f"Intraday ({src_intra}): **{len(intra):,}** bars" if not intra.empty else f"Intraday: N/A"
+    intra_txt = f"Intraday (yfinance): **{len(intra):,}** bars" if not intra.empty else "Intraday: N/A"
     daily_txt = f"Daily ({src_daily}): **{len(daily):,}** bars" if not daily.empty else "Daily: N/A"
-    st.success(f"{intra_txt}  |  {daily_txt}")
+    st.success(f"**{symbol}**  |  {intra_txt}  |  {daily_txt}")
 
     # ── TABS ──
     tabs = st.tabs([
