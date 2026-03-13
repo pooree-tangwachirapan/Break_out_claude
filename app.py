@@ -1,13 +1,14 @@
 """
 Multi-Strategy Trading Dashboard — Streamlit App
 ==================================================
-6 Strategies:
+7 Strategies:
   1. Gap Fill Strategy          (Daily)
   2. Opening Range Breakout     (Intraday)
   3. Oops Strategy              (Daily)
   4. PBD (Consolidation Break)  (Intraday)
   5. Rule of 4 (Post-Event)     (Intraday)
   6. VP Breakout Zones          (Intraday)
+  7. Order Flow Target Map      (Intraday — Multi-TF VP)
 
 Data: FMP Stable API (all data)
 """
@@ -445,6 +446,234 @@ def filter_vp_period(df, period):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY 7: ORDER FLOW TARGET MAP  (Multi-TF VP)
+# ══════════════════════════════════════════════════════════════════════════════
+def calc_vp_full(df, num_bins=50, va_pct=0.70, lvn_sens=0.40, hvn_sens=1.3):
+    """Enhanced VP: returns VAH, VAL, POC, LVN list, HVN list."""
+    if df.empty or len(df) < 2:
+        return None
+    pmin, pmax = df["low"].min(), df["high"].max()
+    if pmin == pmax:
+        return None
+    edges = np.linspace(pmin, pmax, num_bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2
+    bw = edges[1] - edges[0]
+    vap = np.zeros(num_bins)
+    for _, row in df.iterrows():
+        tp = (row["high"] + row["low"] + row["close"]) / 3
+        mask = (centers >= row["low"]) & (centers <= row["high"])
+        if mask.sum() > 0:
+            d = np.abs(centers[mask] - tp)
+            md = max(d.max(), 1e-9)
+            w = 1 - (d / md) * 0.5
+            w /= w.sum()
+            vap[mask] += row["volume"] * w
+    poc_idx = np.argmax(vap)
+    poc = centers[poc_idx]
+    total = vap.sum()
+    if total == 0:
+        return None
+    # Value Area
+    target_vol = total * va_pct
+    va_vol = vap[poc_idx]
+    ui, li = poc_idx, poc_idx
+    while va_vol < target_vol:
+        cu = ui < num_bins - 1
+        cd = li > 0
+        vu = vap[ui + 1] if cu else 0
+        vd = vap[li - 1] if cd else 0
+        if not cu and not cd:
+            break
+        if vu >= vd and cu:
+            ui += 1
+            va_vol += vap[ui]
+        elif cd:
+            li -= 1
+            va_vol += vap[li]
+        else:
+            ui += 1
+            va_vol += vap[ui]
+    vah, val_ = centers[ui], centers[li]
+    avg_v = vap.mean()
+    # LVN: local minima or below threshold
+    lvn_thresh = avg_v * lvn_sens
+    lvns = []
+    for i in range(1, num_bins - 1):
+        is_local_min = vap[i] < vap[i - 1] and vap[i] < vap[i + 1]
+        is_low = vap[i] < lvn_thresh
+        if is_local_min or is_low:
+            lvns.append({"price": round(centers[i], 2), "volume": vap[i]})
+    # HVN: local maxima AND above threshold
+    hvn_thresh = avg_v * hvn_sens
+    hvns = []
+    for i in range(1, num_bins - 1):
+        is_local_max = vap[i] > vap[i - 1] and vap[i] > vap[i + 1]
+        is_high = vap[i] > hvn_thresh
+        if is_local_max and is_high:
+            hvns.append({"price": round(centers[i], 2), "volume": vap[i]})
+    return {
+        "vah": round(vah, 2), "val": round(val_, 2), "poc": round(poc, 2),
+        "lvns": lvns, "hvns": hvns,
+        "price_levels": centers, "volume_at_price": vap, "bin_width": bw,
+    }
+
+
+def compute_of_levels(intra_df):
+    """Compute VP levels for prev-day and prev-week from intraday data."""
+    if intra_df.empty:
+        return None, None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    df = intra_df.copy()
+    df["trade_date"] = df["date"].dt.date
+    dates = sorted(df["trade_date"].unique())
+    if len(dates) < 2:
+        return None, None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    today = dates[-1]
+    prev_day = dates[-2]
+    today_df = df[df["trade_date"] == today].copy()
+    prev_day_df = df[df["trade_date"] == prev_day].copy()
+
+    # Prev week = all data before current week start
+    today_weekday = today.weekday()  # 0=Mon
+    week_start = today - timedelta(days=today_weekday)
+    prev_week_end = week_start - timedelta(days=1)
+    prev_week_start = week_start - timedelta(days=7)
+    prev_week_df = df[(df["trade_date"] >= prev_week_start) &
+                      (df["trade_date"] <= prev_week_end)].copy()
+
+    day_vp = calc_vp_full(prev_day_df)
+    week_vp = calc_vp_full(prev_week_df) if not prev_week_df.empty else None
+
+    return day_vp, week_vp, today_df, prev_day_df, prev_week_df
+
+
+def build_target_ladder(today_open, day_vp, week_vp):
+    """
+    Build price target ladder based on breakout direction.
+    If today opens above prev-day VAH → breakout up (targets go higher).
+    If today opens below prev-day VAL → breakout down (targets go lower).
+    """
+    if day_vp is None:
+        return [], "neutral"
+
+    d_vah = day_vp["vah"]
+    d_val = day_vp["val"]
+    d_poc = day_vp["poc"]
+    d_hvns = day_vp["hvns"]
+    d_lvns = day_vp["lvns"]
+
+    # Determine breakout direction
+    if today_open > d_vah:
+        direction = "breakout_up"
+    elif today_open < d_val:
+        direction = "breakout_down"
+    elif today_open > d_poc:
+        direction = "above_poc"
+    elif today_open < d_poc:
+        direction = "below_poc"
+    else:
+        direction = "at_poc"
+
+    targets = []
+
+    if direction in ("breakout_down", "below_poc"):
+        # Price going DOWN — targets are support levels below
+        # Day levels (closer)
+        targets.append({"price": d_val, "label": "Day VAL", "tf": "day",
+                         "type": "support", "color": "#10b981"})
+        for h in sorted(d_hvns, key=lambda x: x["price"], reverse=True):
+            if h["price"] < today_open:
+                targets.append({"price": h["price"],
+                                "label": f"Day HVN {h['price']:.2f}",
+                                "tf": "day", "type": "support",
+                                "color": "#06b6d4"})
+        targets.append({"price": d_poc, "label": "Day POC", "tf": "day",
+                         "type": "support", "color": "#f59e0b"})
+        for lv in sorted(d_lvns, key=lambda x: x["price"], reverse=True):
+            if lv["price"] < today_open:
+                targets.append({"price": lv["price"],
+                                "label": f"Day LVN {lv['price']:.2f}",
+                                "tf": "day", "type": "magnet",
+                                "color": "#a855f7"})
+        # Week levels (further)
+        if week_vp:
+            w_vah = week_vp["vah"]
+            w_poc = week_vp["poc"]
+            w_val = week_vp["val"]
+            targets.append({"price": w_vah, "label": "Week VAH", "tf": "week",
+                             "type": "support", "color": "#ef4444"})
+            targets.append({"price": w_poc, "label": "Week POC", "tf": "week",
+                             "type": "support", "color": "#f97316"})
+            targets.append({"price": w_val, "label": "Week VAL", "tf": "week",
+                             "type": "support", "color": "#dc2626"})
+            for h in week_vp["hvns"]:
+                if h["price"] < today_open:
+                    targets.append({"price": h["price"],
+                                    "label": f"Week HVN",
+                                    "tf": "week", "type": "support",
+                                    "color": "#0ea5e9"})
+        # Sort descending (closest to price first when falling)
+        targets.sort(key=lambda x: x["price"], reverse=True)
+        targets = [t for t in targets if t["price"] < today_open]
+
+    else:  # breakout_up, above_poc, at_poc
+        # Price going UP — targets are resistance levels above
+        targets.append({"price": d_vah, "label": "Day VAH", "tf": "day",
+                         "type": "resistance", "color": "#ef4444"})
+        for h in sorted(d_hvns, key=lambda x: x["price"]):
+            if h["price"] > today_open:
+                targets.append({"price": h["price"],
+                                "label": f"Day HVN {h['price']:.2f}",
+                                "tf": "day", "type": "resistance",
+                                "color": "#06b6d4"})
+        targets.append({"price": d_poc, "label": "Day POC", "tf": "day",
+                         "type": "resistance", "color": "#f59e0b"})
+        for lv in sorted(d_lvns, key=lambda x: x["price"]):
+            if lv["price"] > today_open:
+                targets.append({"price": lv["price"],
+                                "label": f"Day LVN {lv['price']:.2f}",
+                                "tf": "day", "type": "magnet",
+                                "color": "#a855f7"})
+        if week_vp:
+            targets.append({"price": week_vp["vah"], "label": "Week VAH",
+                             "tf": "week", "type": "resistance",
+                             "color": "#ef4444"})
+            targets.append({"price": week_vp["poc"], "label": "Week POC",
+                             "tf": "week", "type": "resistance",
+                             "color": "#f97316"})
+            targets.append({"price": week_vp["val"], "label": "Week VAL",
+                             "tf": "week", "type": "resistance",
+                             "color": "#dc2626"})
+        targets.sort(key=lambda x: x["price"])
+        targets = [t for t in targets if t["price"] > today_open]
+
+    # Deduplicate close prices (within 0.3%)
+    deduped = []
+    for t in targets:
+        if not deduped or abs(t["price"] - deduped[-1]["price"]) / max(t["price"], 1) > 0.003:
+            deduped.append(t)
+
+    return deduped, direction
+
+
+def track_hits(today_df, targets, direction):
+    """Check which targets have been hit by today's price."""
+    if today_df.empty or not targets:
+        return targets
+    low = today_df["low"].min()
+    high = today_df["high"].max()
+    current = today_df["close"].iloc[-1]
+    for t in targets:
+        if direction in ("breakout_down", "below_poc"):
+            t["hit"] = low <= t["price"]
+        else:
+            t["hit"] = high >= t["price"]
+        t["current_dist"] = round(abs(current - t["price"]), 2)
+        t["current_dist_pct"] = round(abs(current - t["price"]) / max(current, 1) * 100, 2)
+    return targets
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CHART HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def add_candles_simple(fig, df):
@@ -561,6 +790,7 @@ def main():
         "📐 PBD",
         "4️⃣ Rule of 4",
         "📊 VP Zones",
+        "🎯 OF Target",
     ])
 
     # ═══════════════════════════════════════
@@ -930,6 +1160,250 @@ def main():
                     if not vp_sigs.empty:
                         st.dataframe(vp_sigs.sort_values("date", ascending=False),
                                      use_container_width=True, hide_index=True)
+
+
+    # ═══════════════════════════════════════
+    # TAB 7: ORDER FLOW TARGET MAP
+    # ═══════════════════════════════════════
+    with tabs[6]:
+        st.subheader("🎯 Order Flow Target Map")
+        st.caption("Multi-TF Volume Profile — Prev Day + Prev Week → Today's Price Targets")
+        if intra.empty:
+            st.warning("No intraday data. Order Flow Target Map requires intraday bars.")
+        else:
+            of_c1, of_c2 = st.columns([1, 3])
+            with of_c1:
+                of_bins = st.slider("VP Bins", 30, 100, 50, key="of_bins")
+                of_va = st.slider("VA %", 50, 90, 70, key="of_va")
+
+            day_vp, week_vp, today_df, prev_day_df, prev_week_df = compute_of_levels(intra)
+
+            if day_vp is None:
+                st.warning("Need at least 2 days of intraday data.")
+            else:
+                # Today's open
+                today_open = today_df["open"].iloc[0] if not today_df.empty else 0
+                today_current = today_df["close"].iloc[-1] if not today_df.empty else 0
+
+                # Build targets
+                targets, brk_dir = build_target_ladder(today_open, day_vp, week_vp)
+                targets = track_hits(today_df, targets, brk_dir)
+
+                # Direction display
+                dir_map = {
+                    "breakout_up": ("BREAKOUT UP ↑", "#10b981",
+                                    "Open above Day VAH — retest targets above"),
+                    "breakout_down": ("BREAKOUT DOWN ↓", "#ef4444",
+                                      "Open below Day VAL — retest targets below"),
+                    "above_poc": ("ABOVE POC ↑", "#06b6d4",
+                                  "Open above POC — leaning bullish"),
+                    "below_poc": ("BELOW POC ↓", "#f97316",
+                                  "Open below POC — leaning bearish"),
+                    "at_poc": ("AT POC ↔", "#8b95a5",
+                               "Open at POC — balanced, wait for direction"),
+                }
+                dir_label, dir_color, dir_desc = dir_map.get(
+                    brk_dir, ("NEUTRAL", "#8b95a5", ""))
+
+                # Metrics row
+                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                mc1.metric("Today Open", f"{today_open:.2f}")
+                mc2.metric("Current", f"{today_current:.2f}")
+                mc3.metric("Day POC", f"{day_vp['poc']:.2f}")
+                mc4.metric("Day VAH", f"{day_vp['vah']:.2f}")
+                mc5.metric("Day VAL", f"{day_vp['val']:.2f}")
+
+                if week_vp:
+                    wc1, wc2, wc3, wc4 = st.columns(4)
+                    wc1.metric("Week POC", f"{week_vp['poc']:.2f}")
+                    wc2.metric("Week VAH", f"{week_vp['vah']:.2f}")
+                    wc3.metric("Week VAL", f"{week_vp['val']:.2f}")
+                    wc4.metric("Week HVNs", len(week_vp['hvns']))
+
+                # Direction banner
+                st.markdown(
+                    f'<div style="background:{dir_color}22; border-left:4px solid {dir_color};'
+                    f' padding:12px 20px; border-radius:0 8px 8px 0; margin:8px 0;">'
+                    f'<b style="color:{dir_color}; font-size:1.1rem;">{dir_label}</b>'
+                    f'<br><span style="color:#aaa;">{dir_desc}</span></div>',
+                    unsafe_allow_html=True)
+
+                # ── Target Ladder ──
+                if targets:
+                    st.markdown("#### Target Ladder")
+                    for i, t in enumerate(targets):
+                        hit_icon = "✅" if t.get("hit") else "⬜"
+                        tf_badge = "🔵 Day" if t["tf"] == "day" else "🟠 Week"
+                        dist_txt = f'{t["current_dist"]:.2f} ({t["current_dist_pct"]:.2f}%)'
+                        st.markdown(
+                            f'<div style="display:flex; align-items:center; gap:12px;'
+                            f' padding:6px 12px; border-left:3px solid {t["color"]};'
+                            f' margin:2px 0; background:rgba(255,255,255,0.02);'
+                            f' border-radius:0 6px 6px 0;">'
+                            f'<span style="font-size:1.1rem;">{hit_icon}</span>'
+                            f'<span style="min-width:80px;">{tf_badge}</span>'
+                            f'<b style="color:{t["color"]}; min-width:100px;">'
+                            f'{t["price"]:.2f}</b>'
+                            f'<span style="color:#ccc;">{t["label"]}</span>'
+                            f'<span style="color:#666; margin-left:auto;">'
+                            f'dist: {dist_txt}</span>'
+                            f'</div>',
+                            unsafe_allow_html=True)
+                else:
+                    st.info("No targets — price at POC, wait for direction.")
+
+                # ══ CHART: Today candles + dual VP levels ══
+                fig = make_subplots(
+                    rows=1, cols=3,
+                    column_widths=[0.15, 0.7, 0.15],
+                    shared_yaxes=True,
+                    horizontal_spacing=0.01,
+                    subplot_titles=["Week VP", f"Today — {brk_dir.replace('_',' ').title()}", "Day VP"],
+                )
+
+                # Col 2: Today's candles
+                if not today_df.empty:
+                    fig.add_trace(go.Candlestick(
+                        x=today_df["date"], open=today_df["open"],
+                        high=today_df["high"], low=today_df["low"],
+                        close=today_df["close"], name="Today",
+                        increasing_line_color="#10b981",
+                        decreasing_line_color="#ef4444",
+                    ), row=1, col=2)
+
+                xr = [today_df["date"].min(), today_df["date"].max()] if not today_df.empty else [None, None]
+
+                # Day VP lines on candle chart
+                day_lines = [
+                    (day_vp["vah"], "D-VAH", "#ef4444", "solid"),
+                    (day_vp["poc"], "D-POC", "#f59e0b", "dash"),
+                    (day_vp["val"], "D-VAL", "#10b981", "solid"),
+                ]
+                for h in day_vp["hvns"]:
+                    day_lines.append((h["price"], "D-HVN", "#06b6d4", "dot"))
+                for lv in day_vp["lvns"]:
+                    day_lines.append((lv["price"], "D-LVN", "#a855f7", "dot"))
+
+                for price, label, clr, dash in day_lines:
+                    fig.add_trace(go.Scatter(
+                        x=xr, y=[price, price], mode="lines",
+                        name=f"{label} {price:.2f}",
+                        line=dict(color=clr, width=1.2, dash=dash),
+                        legendgroup="day",
+                    ), row=1, col=2)
+
+                # Week VP lines
+                if week_vp:
+                    week_lines = [
+                        (week_vp["vah"], "W-VAH", "#dc2626", "solid"),
+                        (week_vp["poc"], "W-POC", "#f97316", "dash"),
+                        (week_vp["val"], "W-VAL", "#059669", "solid"),
+                    ]
+                    for h in week_vp["hvns"]:
+                        week_lines.append((h["price"], "W-HVN", "#0ea5e9", "dot"))
+
+                    for price, label, clr, dash in week_lines:
+                        fig.add_trace(go.Scatter(
+                            x=xr, y=[price, price], mode="lines",
+                            name=f"{label} {price:.2f}",
+                            line=dict(color=clr, width=1, dash=dash),
+                            legendgroup="week",
+                        ), row=1, col=2)
+
+                # Day VA zone shading
+                fig.add_shape(type="rect", x0=xr[0], x1=xr[1],
+                              y0=day_vp["val"], y1=day_vp["vah"],
+                              fillcolor="rgba(245,158,11,0.06)",
+                              line=dict(width=0), row=1, col=2)
+
+                # Week VA zone shading
+                if week_vp:
+                    fig.add_shape(type="rect", x0=xr[0], x1=xr[1],
+                                  y0=week_vp["val"], y1=week_vp["vah"],
+                                  fillcolor="rgba(249,115,22,0.04)",
+                                  line=dict(color="rgba(249,115,22,0.15)",
+                                            dash="dot", width=1),
+                                  row=1, col=2)
+
+                # Today open line
+                fig.add_trace(go.Scatter(
+                    x=xr, y=[today_open, today_open], mode="lines",
+                    name=f"Open {today_open:.2f}",
+                    line=dict(color="#ffffff", width=1.5, dash="dashdot"),
+                ), row=1, col=2)
+
+                # Target markers on chart
+                for t in targets:
+                    icon = "star" if t.get("hit") else "diamond-open"
+                    fig.add_trace(go.Scatter(
+                        x=[xr[1]], y=[t["price"]], mode="markers",
+                        marker=dict(size=8, color=t["color"], symbol=icon,
+                                    line=dict(width=1, color="white")),
+                        name=f"T: {t['label']}", showlegend=False,
+                    ), row=1, col=2)
+
+                # Col 1: Week VP histogram
+                if week_vp:
+                    wk_colors = []
+                    for p in week_vp["price_levels"]:
+                        if week_vp["val"] <= p <= week_vp["vah"]:
+                            wk_colors.append("rgba(249,115,22,0.5)")
+                        else:
+                            wk_colors.append("rgba(100,100,100,0.25)")
+                    fig.add_trace(go.Bar(
+                        x=week_vp["volume_at_price"],
+                        y=week_vp["price_levels"],
+                        orientation="h", marker_color=wk_colors,
+                        showlegend=False, name="Week VP",
+                    ), row=1, col=1)
+
+                # Col 3: Day VP histogram
+                dy_colors = []
+                for p in day_vp["price_levels"]:
+                    if day_vp["val"] <= p <= day_vp["vah"]:
+                        dy_colors.append("rgba(245,158,11,0.5)")
+                    else:
+                        dy_colors.append("rgba(100,100,100,0.25)")
+                fig.add_trace(go.Bar(
+                    x=day_vp["volume_at_price"],
+                    y=day_vp["price_levels"],
+                    orientation="h", marker_color=dy_colors,
+                    showlegend=False, name="Day VP",
+                ), row=1, col=3)
+
+                # Y-axis: cover all levels
+                all_prices = [today_open, day_vp["vah"], day_vp["val"]]
+                if week_vp:
+                    all_prices += [week_vp["vah"], week_vp["val"]]
+                if not today_df.empty:
+                    all_prices += [today_df["low"].min(), today_df["high"].max()]
+                y_min = min(all_prices)
+                y_max = max(all_prices)
+                y_pad = (y_max - y_min) * 0.1
+                fig.update_yaxes(range=[y_min - y_pad, y_max + y_pad])
+
+                fig.update_layout(
+                    template="plotly_dark", height=750,
+                    xaxis_rangeslider_visible=False,
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                x=0.5, xanchor="center", font=dict(size=8)),
+                    margin=dict(l=40, r=40, t=70, b=30),
+                )
+                fig.update_xaxes(showticklabels=False, row=1, col=1)
+                fig.update_xaxes(showticklabels=False, row=1, col=3)
+                fig.update_yaxes(showticklabels=False, row=1, col=3)
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Summary table
+                if targets:
+                    tdf = pd.DataFrame(targets)
+                    tdf = tdf[["label", "tf", "price", "hit", "current_dist",
+                               "current_dist_pct"]]
+                    tdf.columns = ["Level", "Timeframe", "Price", "Hit",
+                                   "Distance", "Distance %"]
+                    st.dataframe(tdf, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
