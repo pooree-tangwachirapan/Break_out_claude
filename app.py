@@ -75,8 +75,11 @@ def fetch_intraday(symbol: str, api_key: str, interval: str = "5min",
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         return df[df["date"] >= cutoff][cols].reset_index(drop=True)
     except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 403:
-            st.warning("Intraday data requires FMP paid plan.")
+        code = e.response.status_code if e.response is not None else 0
+        if code in (402, 403):
+            st.warning("⚠️ Intraday requires FMP paid plan. "
+                       "Strategies needing intraday (ORB, PBD, R4, VP, OF) "
+                       "will be skipped. Daily strategies still work.")
         else:
             st.error(f"FMP intraday error: {e}")
         return pd.DataFrame()
@@ -728,41 +731,40 @@ def main():
     except Exception:
         api_key = ""
 
-    # Sidebar
+    # Sidebar — form so Enter key triggers Run
     with st.sidebar:
         st.header("⚙️ Settings")
-        symbol = st.text_input("Symbol", value="SPY", key="sym_input").upper().strip()
+        with st.form("settings_form"):
+            symbol = st.text_input("Symbol (Enter = Run)", value="SPY").upper().strip()
 
-        st.divider()
-        st.markdown("**Intraday**")
-        interval = st.selectbox("Interval", ["1min", "5min", "15min", "30min", "1hour"],
-                                index=1, key="interval_input")
-        days_back_intra = st.number_input("Intraday Days", 1, 60, 10,
-                                          key="intra_days_input")
+            st.divider()
+            st.markdown("**Intraday**")
+            interval = st.selectbox("Interval",
+                                    ["1min", "5min", "15min", "30min", "1hour"],
+                                    index=1)
+            days_back_intra = st.number_input("Intraday Days", 1, 60, 10)
 
-        st.divider()
-        st.markdown("**Daily**")
-        days_back_daily = st.number_input("Daily Days", 10, 365, 60, key="daily_days_input")
+            st.divider()
+            st.markdown("**Daily**")
+            days_back_daily = st.number_input("Daily Days", 10, 365, 60)
+
+            submitted = st.form_submit_button(
+                "🚀 Run All Strategies", type="primary",
+                use_container_width=True)
 
         if not api_key:
-            st.error("FMP API Key not set in Secrets.")
+            st.error("⚠️ FMP API Key not set in Secrets.")
 
-        st.divider()
-
-        # ── Run button ──
-        if st.button("🚀 Run All Strategies", type="primary", use_container_width=True):
-            with st.spinner(f"Fetching intraday {interval} for {symbol}..."):
-                st.session_state.intra = fetch_intraday(symbol, api_key, interval, days_back_intra)
-
+        if submitted:
             with st.spinner(f"Fetching daily for {symbol}..."):
                 st.session_state.daily = fetch_daily(symbol, api_key, days_back_daily)
 
+            with st.spinner(f"Fetching intraday {interval} for {symbol}..."):
+                st.session_state.intra = fetch_intraday(symbol, api_key,
+                                                         interval, days_back_intra)
+
             st.session_state.symbol = symbol
             st.session_state.data_loaded = True
-
-        if st.session_state.data_loaded and st.session_state.symbol != symbol:
-            st.warning(f"Data loaded for **{st.session_state.symbol}**. "
-                       f"Click Run to load **{symbol}**.")
 
     # ── Gate ──
     if not st.session_state.data_loaded:
