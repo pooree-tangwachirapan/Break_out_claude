@@ -2,16 +2,14 @@
 Multi-Strategy Trading Dashboard — Streamlit App
 ==================================================
 6 Strategies:
-  1. Gap Fill Strategy          (Daily — FMP)
-  2. Opening Range Breakout     (Intraday — yfinance)
-  3. Oops Strategy              (Daily — FMP)
-  4. PBD (Consolidation Break)  (Intraday — yfinance)
-  5. Rule of 4 (Post-Event)     (Intraday — yfinance)
-  6. VP Breakout Zones          (Intraday — yfinance)
+  1. Gap Fill Strategy          (Daily)
+  2. Opening Range Breakout     (Intraday)
+  3. Oops Strategy              (Daily)
+  4. PBD (Consolidation Break)  (Intraday)
+  5. Rule of 4 (Post-Event)     (Intraday)
+  6. VP Breakout Zones          (Intraday)
 
-Data Sources:
-  - FMP Stable API  → daily OHLCV (free tier OK)
-  - yfinance        → intraday OHLCV (free, no key needed)
+Data: FMP Stable API (all data)
 """
 
 import streamlit as st
@@ -20,7 +18,6 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-import yfinance as yf
 from datetime import datetime, timedelta, time as dtime
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -47,148 +44,65 @@ st.markdown("""
 .zone-box { border-radius: 8px; padding: 0.6rem 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; }
 .zone-upper { background: rgba(239,83,80,0.08); border-left: 4px solid #ef5350; }
 .zone-lower { background: rgba(38,166,154,0.08); border-left: 4px solid #26a69a; }
-.src-badge {
-    display: inline-block; font-size: 0.6rem; padding: 2px 8px;
-    border-radius: 10px; font-weight: 600; margin-left: 6px;
-}
-.src-fmp { background: #0f3460; color: #60a5fa; }
-.src-yf  { background: #1a3a1a; color: #6ee7b7; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHING
+# DATA FETCHING — FMP Stable API only
 # ══════════════════════════════════════════════════════════════════════════════
 FMP_BASE = "https://financialmodelingprep.com/stable"
 
-# ── yfinance interval mapping ──
-YF_INTERVAL_MAP = {
-    "1min": "1m",
-    "5min": "5m",
-    "15min": "15m",
-    "30min": "30m",
-    "1hour": "1h",
-}
-
-# yfinance max period per interval
-YF_MAX_DAYS = {
-    "1m": 7,
-    "5m": 60,
-    "15m": 60,
-    "30m": 60,
-    "1h": 730,
-}
-
 
 @st.cache_data(ttl=300)
-def fetch_intraday_yf(symbol: str, interval: str = "5min", days_back: int = 15) -> pd.DataFrame:
-    """Fetch intraday data from yfinance (FREE, no API key)."""
-    yf_interval = YF_INTERVAL_MAP.get(interval, "5m")
-    max_days = YF_MAX_DAYS.get(yf_interval, 60)
-    actual_days = min(days_back, max_days)
-
+def fetch_intraday(symbol: str, api_key: str, interval: str = "5min",
+                   days_back: int = 15) -> pd.DataFrame:
+    """Fetch intraday data from FMP stable API."""
+    if not api_key:
+        return pd.DataFrame()
+    url = f"{FMP_BASE}/historical-chart/{interval}"
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=f"{actual_days}d", interval=yf_interval)
-
-        if df.empty:
+        r = requests.get(url, params={"symbol": symbol, "apikey": api_key}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if not data or isinstance(data, dict):
             return pd.DataFrame()
-
-        df = df.reset_index()
-
-        # Normalize column names (yfinance capitalizes them)
-        rename_map = {}
-        for col in df.columns:
-            lower = col.lower()
-            if lower in ("date", "datetime"):
-                rename_map[col] = "date"
-            elif lower in ("open", "high", "low", "close", "volume"):
-                rename_map[col] = lower
-        df = df.rename(columns=rename_map)
-
-        # Ensure date column exists
-        if "date" not in df.columns:
-            # Try index
-            df = df.reset_index()
-            for col in df.columns:
-                if "date" in col.lower() or "time" in col.lower():
-                    df = df.rename(columns={col: "date"})
-                    break
-
-        if "date" not in df.columns:
-            return pd.DataFrame()
-
+        df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
-        # Remove timezone info if present
-        if df["date"].dt.tz is not None:
-            df["date"] = df["date"].dt.tz_localize(None)
-
+        df = df.sort_values("date").reset_index(drop=True)
+        cutoff = datetime.now() - timedelta(days=days_back)
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
-        df = df[cols].sort_values("date").reset_index(drop=True)
-        return df
-
+        return df[df["date"] >= cutoff][cols].reset_index(drop=True)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403:
+            st.warning("Intraday data requires FMP paid plan.")
+        else:
+            st.error(f"FMP intraday error: {e}")
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"yfinance error: {e}")
+        st.error(f"FMP intraday error: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
-def fetch_daily_fmp(symbol: str, api_key: str, days: int = 60) -> pd.DataFrame:
-    """Fetch daily data from FMP stable API (free tier OK)."""
+def fetch_daily(symbol: str, api_key: str, days: int = 60) -> pd.DataFrame:
+    """Fetch daily data from FMP stable API."""
     if not api_key:
-        st.warning("FMP API Key not set — trying yfinance for daily data too.")
-        return fetch_daily_yf(symbol, days)
-
+        return pd.DataFrame()
     url = f"{FMP_BASE}/historical-price-eod/full"
     try:
         r = requests.get(url, params={"symbol": symbol, "apikey": api_key}, timeout=15)
         r.raise_for_status()
         data = r.json()
         if not data or isinstance(data, dict):
-            st.warning("FMP returned no daily data — falling back to yfinance.")
-            return fetch_daily_yf(symbol, days)
-
+            return pd.DataFrame()
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date").reset_index(drop=True)
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         return df[cols].tail(days).reset_index(drop=True)
     except Exception as e:
-        st.warning(f"FMP error ({e}) — falling back to yfinance.")
-        return fetch_daily_yf(symbol, days)
-
-
-@st.cache_data(ttl=300)
-def fetch_daily_yf(symbol: str, days: int = 60) -> pd.DataFrame:
-    """Fallback: fetch daily data from yfinance."""
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=f"{days}d", interval="1d")
-        if df.empty:
-            return pd.DataFrame()
-        df = df.reset_index()
-        rename_map = {}
-        for col in df.columns:
-            lower = col.lower()
-            if lower in ("date", "datetime"):
-                rename_map[col] = "date"
-            elif lower in ("open", "high", "low", "close", "volume"):
-                rename_map[col] = lower
-        df = df.rename(columns=rename_map)
-        if "date" not in df.columns:
-            df = df.reset_index()
-            for col in df.columns:
-                if "date" in col.lower():
-                    df = df.rename(columns={col: "date"})
-                    break
-        df["date"] = pd.to_datetime(df["date"])
-        if df["date"].dt.tz is not None:
-            df["date"] = df["date"].dt.tz_localize(None)
-        cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
-        return df[cols].sort_values("date").reset_index(drop=True)
-    except Exception as e:
-        st.error(f"yfinance daily error: {e}")
+        st.error(f"FMP daily error: {e}")
         return pd.DataFrame()
 
 
@@ -570,7 +484,7 @@ def base_layout(fig, title, height=600):
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     st.markdown("## 📊 Multi-Strategy Trading Dashboard")
-    st.caption("Daily data → FMP API  |  Intraday data → yfinance (free)")
+    st.caption("Data: FMP Stable API")
 
     # ── Initialize session state ──
     if "data_loaded" not in st.session_state:
@@ -578,7 +492,6 @@ def main():
         st.session_state.intra = pd.DataFrame()
         st.session_state.daily = pd.DataFrame()
         st.session_state.symbol = ""
-        st.session_state.src_daily = ""
 
     # API key
     try:
@@ -592,59 +505,52 @@ def main():
         symbol = st.text_input("Symbol", value="SPY", key="sym_input").upper().strip()
 
         st.divider()
-        st.markdown("**Intraday** <span class='src-badge src-yf'>yfinance</span>",
-                    unsafe_allow_html=True)
+        st.markdown("**Intraday**")
         interval = st.selectbox("Interval", ["1min", "5min", "15min", "30min", "1hour"],
                                 index=1, key="interval_input")
         days_back_intra = st.number_input("Intraday Days", 1, 60, 10,
-                                          help="yfinance: 1m→7d max, 5m/15m/30m→60d max",
                                           key="intra_days_input")
 
         st.divider()
-        st.markdown("**Daily** <span class='src-badge src-fmp'>FMP</span>",
-                    unsafe_allow_html=True)
+        st.markdown("**Daily**")
         days_back_daily = st.number_input("Daily Days", 10, 365, 60, key="daily_days_input")
 
         if not api_key:
-            st.info("💡 FMP key not set — daily data will use yfinance fallback.")
+            st.error("FMP API Key not set in Secrets.")
 
         st.divider()
 
-        # ── Run button: fetch data and store in session_state ──
+        # ── Run button ──
         if st.button("🚀 Run All Strategies", type="primary", use_container_width=True):
-            with st.spinner(f"Fetching intraday {interval} for {symbol} via yfinance..."):
-                st.session_state.intra = fetch_intraday_yf(symbol, interval, days_back_intra)
+            with st.spinner(f"Fetching intraday {interval} for {symbol}..."):
+                st.session_state.intra = fetch_intraday(symbol, api_key, interval, days_back_intra)
 
             with st.spinner(f"Fetching daily for {symbol}..."):
-                st.session_state.daily = fetch_daily_fmp(symbol, api_key, days_back_daily)
+                st.session_state.daily = fetch_daily(symbol, api_key, days_back_daily)
 
             st.session_state.symbol = symbol
-            st.session_state.src_daily = "FMP" if api_key else "yfinance"
             st.session_state.data_loaded = True
 
-        # Show reload button if data exists with different symbol
         if st.session_state.data_loaded and st.session_state.symbol != symbol:
             st.warning(f"Data loaded for **{st.session_state.symbol}**. "
                        f"Click Run to load **{symbol}**.")
 
-    # ── Gate: need data to proceed ──
+    # ── Gate ──
     if not st.session_state.data_loaded:
         st.info("Configure settings and click **🚀 Run All Strategies**")
         return
 
-    # ── Use data from session_state ──
     intra = st.session_state.intra
     daily = st.session_state.daily
     symbol = st.session_state.symbol
-    src_daily = st.session_state.src_daily
 
     if intra.empty and daily.empty:
-        st.error("No data returned. Check symbol and try again.")
+        st.error("No data returned. Check symbol / API key.")
         return
 
     # Status bar
-    intra_txt = f"Intraday (yfinance): **{len(intra):,}** bars" if not intra.empty else "Intraday: N/A"
-    daily_txt = f"Daily ({src_daily}): **{len(daily):,}** bars" if not daily.empty else "Daily: N/A"
+    intra_txt = f"Intraday: **{len(intra):,}** bars" if not intra.empty else "Intraday: N/A"
+    daily_txt = f"Daily: **{len(daily):,}** bars" if not daily.empty else "Daily: N/A"
     st.success(f"**{symbol}**  |  {intra_txt}  |  {daily_txt}")
 
     # ── TABS ──
@@ -662,7 +568,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[0]:
         st.subheader("📉 Gap Fill Strategy")
-        st.caption(f"Data: Daily ({src_daily})")
+        st.caption("Data: Daily (FMP)")
         if daily.empty:
             st.warning("No daily data available.")
         else:
@@ -684,7 +590,8 @@ def main():
 
                 last = gap_signals.iloc[-1]
                 last_idx = daily[daily["date"] == last["date"]].index[0]
-                chart_df = daily.iloc[max(0, last_idx - 5):last_idx + 2]
+                # Show more bars for better context
+                chart_df = daily.iloc[max(0, last_idx - 15):min(len(daily), last_idx + 5)]
                 fig = go.Figure()
                 add_candles_simple(fig, chart_df)
                 fig.add_hline(y=last["prev_close"], line_color="#3b82f6", line_dash="dash",
@@ -695,7 +602,12 @@ def main():
                               y1=max(last["prev_close"], last["open"]),
                               fillcolor="rgba(59,130,246,0.08)",
                               line=dict(color="rgba(59,130,246,0.3)", dash="dash"))
-                base_layout(fig, f"Gap Fill — {last['type']} | {last['status']}")
+                # Y-axis padding for better zoom
+                y_min = chart_df["low"].min()
+                y_max = chart_df["high"].max()
+                y_pad = (y_max - y_min) * 0.15
+                fig.update_yaxes(range=[y_min - y_pad, y_max + y_pad])
+                base_layout(fig, f"Gap Fill — {last['type']} | {last['status']}", height=700)
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(gap_signals.sort_values("date", ascending=False),
                              use_container_width=True, hide_index=True)
@@ -705,7 +617,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[1]:
         st.subheader("⏰ Opening Range Breakout")
-        st.caption("Data: Intraday (yfinance)")
+        st.caption("Data: Intraday (FMP)")
         if intra.empty:
             st.warning("No intraday data available.")
         else:
@@ -755,7 +667,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[2]:
         st.subheader("😲 Oops Strategy")
-        st.caption(f"Data: Daily ({src_daily})")
+        st.caption("Data: Daily (FMP)")
         if daily.empty:
             st.warning("No daily data available.")
         else:
@@ -776,7 +688,8 @@ def main():
 
                 last = oops_signals.iloc[-1]
                 idx = daily[daily["date"] == last["date"]].index[0]
-                chart_df = daily.iloc[max(0, idx - 3):idx + 2]
+                # Show more bars for better context
+                chart_df = daily.iloc[max(0, idx - 10):min(len(daily), idx + 5)]
                 fig = go.Figure()
                 add_candles_simple(fig, chart_df)
                 fig.add_hline(y=last["prev_high"], line_color="#ec4899", line_dash="dash",
@@ -785,7 +698,12 @@ def main():
                               annotation_text=f"Prev Low {last['prev_low']}")
                 fig.add_hline(y=last["prev_close"], line_color="#3b82f6", line_dash="dash",
                               annotation_text=f"Prev Close {last['prev_close']}")
-                base_layout(fig, f"Oops — {last['type']} | {last['status']}")
+                # Y-axis padding for better zoom
+                y_min = chart_df["low"].min()
+                y_max = chart_df["high"].max()
+                y_pad = (y_max - y_min) * 0.15
+                fig.update_yaxes(range=[y_min - y_pad, y_max + y_pad])
+                base_layout(fig, f"Oops — {last['type']} | {last['status']}", height=700)
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(oops_signals.sort_values("date", ascending=False),
                              use_container_width=True, hide_index=True)
@@ -795,7 +713,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[3]:
         st.subheader("📐 PBD Strategy (Consolidation Breakout)")
-        st.caption("Data: Intraday (yfinance)")
+        st.caption("Data: Intraday (FMP)")
         if intra.empty:
             st.warning("No intraday data available.")
         else:
@@ -846,7 +764,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[4]:
         st.subheader("4️⃣ Rule of 4")
-        st.caption("Data: Intraday (yfinance) — รอ N แท่งแรก แล้วเทรด breakout")
+        st.caption("Data: Intraday (FMP) — รอ N แท่งแรก แล้วเทรด breakout")
         if intra.empty:
             st.warning("No intraday data available.")
         else:
@@ -896,7 +814,7 @@ def main():
     # ═══════════════════════════════════════
     with tabs[5]:
         st.subheader("📊 Volume Profile Breakout Zones")
-        st.caption("Data: Intraday (yfinance)")
+        st.caption("Data: Intraday (FMP)")
         if intra.empty:
             st.warning("No intraday data. VP Zones requires intraday bars.")
         else:
